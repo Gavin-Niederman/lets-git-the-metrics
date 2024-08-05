@@ -13,9 +13,8 @@ struct Args {
     #[arg(long, short)]
     weighted: bool,
 
-    #[arg(long, short)]
-    /// The maximum depth of events to fetch. If not specified, no events will be fetched.
-    events_depth: Option<u32>,
+    #[arg(long, short, default_value = "")]
+    excluded_langs: Vec<String>,
 }
 
 struct GitHub {
@@ -23,6 +22,7 @@ struct GitHub {
     user: String,
     auth_code: Option<String>,
     weighted: bool,
+    excluded_langs: Vec<String>,
 }
 impl GitHub {
     pub fn from_args(args: Args) -> Self {
@@ -31,6 +31,11 @@ impl GitHub {
             user: args.user,
             auth_code: args.token,
             weighted: args.weighted,
+            excluded_langs: args
+                .excluded_langs
+                .into_iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect(),
         }
     }
 
@@ -123,17 +128,25 @@ async fn handle_repo(
         .await?
         .text()
         .await?;
-    let langs: Vec<LOCData> = serde_json::from_str(&langs_json).unwrap();
+    let Ok(langs)  = serde_json::from_str::<Vec<LOCData>>(&langs_json) else {
+        println!("Failed to get language data for repo: {}", repo.full_name);
+        return Ok(None);
+    };
 
     let language_loc_map: BTreeMap<String, u32> = langs
         .into_iter()
-        .filter(|data| data.language != "Total")
+        .filter(|data| {
+            data.language != "Total"
+                && !connection
+                    .excluded_langs
+                    .contains(&data.language.to_ascii_lowercase())
+        })
         .map(|data| (data.language, data.lines_of_code))
         .collect();
 
     let stars = repo.stargazers_count;
 
-    println!("Processed new repo! {stars} stars found with {:.2}% of contributions being from selected user.", ratio_of_contributions * 100.0);
+    println!("Processed new repo: {}! {stars} stars found with {:.2}% of contributions being from selected user.", repo.full_name, ratio_of_contributions * 100.0);
     Ok(Some(RepoInfo {
         language_loc_map,
         ratio_of_commits_from_user: ratio_of_contributions,
@@ -145,6 +158,8 @@ async fn handle_repo(
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let connection = GitHub::from_args(args);
+
+    println!("Excluding languages: {:?}", connection.excluded_langs);
 
     let repos = collect_repos(&connection).await?;
 
