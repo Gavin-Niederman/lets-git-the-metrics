@@ -128,7 +128,7 @@ async fn handle_repo(
         .await?
         .text()
         .await?;
-    let Ok(langs)  = serde_json::from_str::<Vec<LOCData>>(&langs_json) else {
+    let Ok(langs) = serde_json::from_str::<Vec<LOCData>>(&langs_json) else {
         println!("Failed to get language data for repo: {}", repo.full_name);
         return Ok(None);
     };
