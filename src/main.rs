@@ -11,7 +11,11 @@ struct Args {
     #[arg(long, short)]
     token: Option<String>,
     #[arg(long, short)]
-    contribution_weights: bool,
+    weighted: bool,
+
+    #[arg(long, short)]
+    /// The maximum depth of events to fetch. If not specified, no events will be fetched.
+    events_depth: Option<u32>,
 }
 
 struct GitHub {
@@ -26,7 +30,7 @@ impl GitHub {
             client: Client::new(),
             user: args.user,
             auth_code: args.token,
-            weighted: args.contribution_weights,
+            weighted: args.weighted,
         }
     }
 
@@ -36,14 +40,14 @@ impl GitHub {
             .await?
             .text()
             .await?;
-        let data: UserData = serde_json::from_str(&json)?;
+        let data: UserData = serde_json::from_str(&json).unwrap();
         Ok(data)
     }
 
     pub async fn get(&self, url: impl IntoUrl) -> reqwest::Result<Response> {
         let mut builder = self
             .client
-            .get(url)
+            .get(format!("{}?per_page=1000", url.as_str()))
             .header("User-Agent", "GitHub user stats scraper (reqwest/hyper)");
         if let Some(auth) = &self.auth_code {
             builder = builder.header("Authorization", format!("Bearer {auth}"));
@@ -61,27 +65,27 @@ async fn collect_repos(connection: &GitHub) -> Result<Vec<RepoData>, Box<dyn Err
     );
 
     let repos_data = connection.get(user_data.repos_url).await?.text().await?;
-    let mut repos: Vec<RepoData> = serde_json::from_str(&repos_data)?;
-    println!("Found all user repos!");
+    let mut repos: Vec<RepoData> = serde_json::from_str(&repos_data).unwrap();
+    println!("Found all {} user repos!", repos.len());
 
     let orgs_data = connection
         .get(user_data.organizations_url)
         .await?
         .text()
         .await?;
-    let orgs_data: Vec<OrgData> = serde_json::from_str(&orgs_data)?;
+    let orgs_data: Vec<OrgData> = serde_json::from_str(&orgs_data).unwrap();
     for org in orgs_data {
         let repos_data = connection.get(org.repos_url).await?.text().await?;
-        let repos_data: Vec<RepoData> = serde_json::from_str(&repos_data)?;
+        let repos_data: Vec<RepoData> = serde_json::from_str(&repos_data).unwrap();
+        println!("Found {} organization repos!", repos_data.len());
         repos.extend(repos_data)
     }
-    println!("Found all organization repos!");
 
     Ok(repos)
 }
 
 struct RepoInfo {
-    language_ratios: BTreeMap<String, f32>,
+    language_loc_map: BTreeMap<String, u32>,
     ratio_of_commits_from_user: f32,
     stars: u32,
 }
@@ -92,7 +96,9 @@ async fn handle_repo(
 ) -> Result<Option<RepoInfo>, Box<dyn Error>> {
     // Get the ratio of all contributions to contributions from the user
     let contributors_json = connection.get(&repo.contributors_url).await?.text().await?;
-    let contributors: Vec<ContributorData> = serde_json::from_str(&contributors_json)?;
+    let Ok(contributors) = serde_json::from_str::<Vec<ContributorData>>(&contributors_json) else {
+        return Ok(None);
+    };
 
     let total_contributions = contributors
         .iter()
@@ -107,20 +113,29 @@ async fn handle_repo(
     let ratio_of_contributions = user_contributor.contributions as f32 / total_contributions as f32;
 
     // Get the ratio of all languages in the repo
-    let langs_json = connection.get(&repo.languages_url).await?.text().await?;
-    let langs: BTreeMap<String, u32> = serde_json::from_str(&langs_json)?;
+    let langs_json = connection
+        .client
+        .get(format!(
+            "https://api.codetabs.com/v1/loc/?github={}",
+            &repo.full_name
+        ))
+        .send()
+        .await?
+        .text()
+        .await?;
+    let langs: Vec<LOCData> = serde_json::from_str(&langs_json).unwrap();
 
-    let langs_sum: u32 = langs.values().sum();
-
-    let langs_ratios: BTreeMap<String, f32> = langs
+    let language_loc_map: BTreeMap<String, u32> = langs
         .into_iter()
-        .map(|(lang, val)| (lang, val as f32 / langs_sum as f32))
+        .filter(|data| data.language != "Total")
+        .map(|data| (data.language, data.lines_of_code))
         .collect();
 
     let stars = repo.stargazers_count;
 
+    println!("Processed new repo! {stars} stars found with {:.2}% of contributions being from selected user.", ratio_of_contributions * 100.0);
     Ok(Some(RepoInfo {
-        language_ratios: langs_ratios,
+        language_loc_map,
         ratio_of_commits_from_user: ratio_of_contributions,
         stars,
     }))
@@ -145,11 +160,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Sum all language ratios into a new map
     let mut langs_map: BTreeMap<String, f32> = BTreeMap::new();
     for info in repos_info.iter() {
-        for (lang, val) in info.language_ratios.clone() {
+        for (lang, val) in info.language_loc_map.clone() {
             let val = if connection.weighted {
-                val * info.ratio_of_commits_from_user
+                val as f32 * info.ratio_of_commits_from_user
             } else {
-                val
+                val as f32
             };
             if let Some(old) = langs_map.get(&lang) {
                 let new = old + val;
@@ -195,6 +210,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 #[derive(Deserialize, Debug)]
+struct LOCData {
+    language: String,
+    #[serde(rename(deserialize = "linesOfCode"))]
+    lines_of_code: u32,
+}
+
+#[derive(Deserialize, Debug)]
 struct UserData {
     pub organizations_url: String,
     pub repos_url: String,
@@ -203,8 +225,8 @@ struct UserData {
 #[derive(Deserialize, Debug)]
 struct RepoData {
     pub stargazers_count: u32,
-    pub languages_url: String,
     pub contributors_url: String,
+    pub full_name: String,
 }
 
 #[derive(Deserialize, Debug)]
